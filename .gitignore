@@ -8,7 +8,7 @@
 
 # actionlint binary (downloaded in CI)
 /actionlint
-download-actionlint.bash
+/download-actionlint.bash
 
 # Logs / scratch
 *.log
