@@ -1,0 +1,29 @@
+# Single-board caller — copy this into YOUR repo at
+#   .github/workflows/add-to-project.yml
+# and adjust `project-url`.
+#
+# Prerequisite: a repo secret PROJMAGIC_TOKEN holding a classic PAT with the
+# `project` scope (+ `read:org` for org-owned boards). The repo GITHUB_TOKEN
+# does NOT work for Projects v2 — see the projmagic README.
+
+name: Add issues to my project
+
+on:
+  issues:
+    types: [opened]
+    # add `reopened`, `transferred`, or `labeled` here if you want those too
+
+jobs:
+  add-to-project:
+    uses: jvrck/projmagic/.github/workflows/add-to-project.yml@v1
+    with:
+      # Your Projects v2 board URL:
+      #   user board: https://github.com/users/<you>/projects/<number>
+      #   org board:  https://github.com/orgs/<org>/projects/<number>
+      project-url: https://github.com/users/OWNER/projects/NUMBER
+
+      # Optional label filter (delete if you want every issue added):
+      # labeled: bug, needs-triage
+      # label-operator: OR        # OR (any) | AND (all) | NOT (exclude)
+    secrets:
+      token: ${{ secrets.PROJMAGIC_TOKEN }}
