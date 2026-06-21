@@ -1,0 +1,62 @@
+name: Add to project
+
+# Reusable workflow — adds the triggering issue to a GitHub Projects v2 board.
+#
+# Call it from a caller workflow in YOUR repo that triggers on `issues: opened`
+# (and/or reopened/labeled). Reusable workflows run in the CALLER's event
+# context, so the issue trigger lives in the caller — this file declares none.
+#
+# IMPORTANT: Projects v2 boards are owned by a user or org, not by the repo, so
+# the repo-scoped GITHUB_TOKEN CANNOT add items to them (it silently no-ops /
+# 403s). You MUST pass a classic PAT with the `project` scope as the `token`
+# secret (add `read:org` for org-owned boards). See the README.
+
+on:
+  workflow_call:
+    inputs:
+      project-url:
+        description: >-
+          URL of the Projects v2 board to add the issue to, e.g.
+          https://github.com/users/OWNER/projects/NUMBER or
+          https://github.com/orgs/ORG/projects/NUMBER
+        type: string
+        required: true
+      labeled:
+        description: >-
+          Optional comma-separated list of labels used as a filter; only issues
+          carrying a matching label are added (see label-operator). Empty means
+          add every issue.
+        type: string
+        required: false
+        default: ''
+      label-operator:
+        description: >-
+          How `labeled` is matched: OR (any listed label), AND (all listed
+          labels), or NOT (exclude any listed label). Defaults to OR.
+        type: string
+        required: false
+        default: OR
+    secrets:
+      token:
+        description: >-
+          A classic personal access token with the `project` scope (plus
+          `read:org` for org-owned boards). The repo GITHUB_TOKEN does NOT work
+          for Projects v2.
+        required: true
+
+# The action authenticates with the `token` secret above, not GITHUB_TOKEN,
+# so the job needs no default-token permissions.
+permissions: {}
+
+jobs:
+  add-to-project:
+    name: Add issue to project
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add issue to project board
+        uses: actions/add-to-project@v2
+        with:
+          project-url: ${{ inputs.project-url }}
+          github-token: ${{ secrets.token }}
+          labeled: ${{ inputs.labeled }}
+          label-operator: ${{ inputs.label-operator }}
