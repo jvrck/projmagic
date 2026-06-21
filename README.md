@@ -163,13 +163,6 @@ gh project item-list <number> --owner <owner> --format json \
   | jq '.items[] | {title: .content.title, url: .content.url}'
 ```
 
-## Roadmap
-
-- **GitHub App auth** — a future hardened, no-PAT distribution path (via
-  `actions/create-github-app-token`) for when projmagic has external users. Not built yet;
-  the classic PAT above is the supported path today.
-- Field-setting "magic" (set status/fields by name) — deferred to a later increment.
-
 ## License
 
 [MIT](./LICENSE) © Jim Vrckovski
