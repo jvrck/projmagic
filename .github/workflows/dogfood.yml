@@ -1,0 +1,20 @@
+name: Dogfood — add issues to the projmagic board
+
+# projmagic eats its own dog food: every issue opened in this repo is auto-added
+# to the projmagic Projects v2 board (https://github.com/users/jvrck/projects/34)
+# by calling our own reusable workflow through a local path reference.
+#
+# This is also the canonical single-board CALLER example. Note the `issues`
+# trigger lives HERE, in the caller — the reusable workflow declares none.
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  add-to-project:
+    uses: ./.github/workflows/add-to-project.yml
+    with:
+      project-url: https://github.com/users/jvrck/projects/34
+    secrets:
+      token: ${{ secrets.PROJMAGIC_TOKEN }}
