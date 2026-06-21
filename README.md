@@ -1,12 +1,13 @@
 # projmagic
 
-> Auto-add newly-opened issues to a [GitHub Projects v2](https://docs.github.com/issues/planning-and-tracking-with-projects) board — a one-line reusable workflow you drop into any repo.
+> Auto-add newly-opened issues to one — or more — [GitHub Projects v2](https://docs.github.com/issues/planning-and-tracking-with-projects) boards — a one-line reusable workflow you drop into any repo.
 
 [![CI](https://github.com/jvrck/projmagic/actions/workflows/ci.yml/badge.svg)](https://github.com/jvrck/projmagic/actions/workflows/ci.yml)
 
 **projmagic** wraps [`actions/add-to-project`](https://github.com/actions/add-to-project)
 into a shareable reusable workflow. Add one small caller workflow to your repository and
-every new issue is added to your project board automatically.
+every new issue is added to your project board automatically — to a single board, or
+fanned out across several at once.
 
 ---
 
@@ -103,15 +104,40 @@ jobs:
 When you filter by label, also trigger on `labeled` so issues that gain the label later are
 added: `types: [opened, labeled]`.
 
+### Multiple boards
+
+To add the same issue to **several** boards at once, use `project-urls` instead of
+`project-url`. It accepts a newline-separated list (most readable) or a JSON array. The
+issue is added to **every** board — one matrix leg per board, so one bad board never blocks
+the others.
+
+```yaml
+jobs:
+  add-to-project:
+    uses: jvrck/projmagic/.github/workflows/add-to-project.yml@v1
+    with:
+      project-urls: |
+        https://github.com/users/<you>/projects/<number>
+        https://github.com/orgs/<org>/projects/<number>
+    secrets:
+      token: ${{ secrets.PROJMAGIC_TOKEN }}
+```
+
+Equivalent JSON-array form: `project-urls: '["https://.../projects/1", "https://.../projects/2"]'`.
+A ready-to-copy version lives in [`examples/multi-board.yml`](./examples/multi-board.yml).
+
 ---
 
 ## Inputs & secrets
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `project-url` | **yes** | — | URL of the Projects v2 board to add the issue to. |
+| `project-url` | yes\* | `''` | A single Projects v2 board URL. |
+| `project-urls` | yes\* | `''` | Multiple board URLs — a JSON array or a newline/comma-separated list. Combined with `project-url`; duplicates removed. |
 | `labeled` | no | `''` | Comma-separated label filter; empty means add every issue. |
 | `label-operator` | no | `OR` | How `labeled` matches: `OR` (any), `AND` (all), `NOT` (exclude). |
+
+\* Provide **`project-url`** (single board) **or** **`project-urls`** (one or more). At least one URL must resolve, or the run fails fast with a clear error.
 
 | Secret | Required | Description |
 | --- | --- | --- |
@@ -139,8 +165,6 @@ gh project item-list <number> --owner <owner> --format json \
 
 ## Roadmap
 
-- **Multiple boards** — add one issue to *several* boards at once via a list input + matrix
-  fan-out. Landing in `v1.1` (`@v1` will pick it up automatically).
 - **GitHub App auth** — a future hardened, no-PAT distribution path (via
   `actions/create-github-app-token`) for when projmagic has external users. Not built yet;
   the classic PAT above is the supported path today.

@@ -1,10 +1,15 @@
 name: Add to project
 
-# Reusable workflow — adds the triggering issue to a GitHub Projects v2 board.
+# Reusable workflow — adds the triggering issue to one OR MORE GitHub Projects v2
+# boards.
 #
 # Call it from a caller workflow in YOUR repo that triggers on `issues: opened`
 # (and/or reopened/labeled). Reusable workflows run in the CALLER's event
 # context, so the issue trigger lives in the caller — this file declares none.
+#
+# Single board:   pass `project-url` (a plain URL).
+# Multiple boards: pass `project-urls` (a JSON array OR a newline/comma list).
+# The issue is added to EVERY resolved board (one matrix leg per board).
 #
 # IMPORTANT: Projects v2 boards are owned by a user or org, not by the repo, so
 # the repo-scoped GITHUB_TOKEN CANNOT add items to them (it silently no-ops /
@@ -16,11 +21,22 @@ on:
     inputs:
       project-url:
         description: >-
-          URL of the Projects v2 board to add the issue to, e.g.
+          A single Projects v2 board URL, e.g.
           https://github.com/users/OWNER/projects/NUMBER or
-          https://github.com/orgs/ORG/projects/NUMBER
+          https://github.com/orgs/ORG/projects/NUMBER. Use this for the common
+          one-board case. Optional if `project-urls` is given.
         type: string
-        required: true
+        required: false
+        default: ''
+      project-urls:
+        description: >-
+          Multiple Projects v2 board URLs — either a JSON array
+          (["https://.../projects/1","https://.../projects/2"]) or a
+          newline- and/or comma-separated list. Combined with `project-url`;
+          duplicates are removed. Provide `project-url` or `project-urls`.
+        type: string
+        required: false
+        default: ''
       labeled:
         description: >-
           Optional comma-separated list of labels used as a filter; only issues
@@ -45,18 +61,83 @@ on:
         required: true
 
 # The action authenticates with the `token` secret above, not GITHUB_TOKEN,
-# so the job needs no default-token permissions.
+# so the jobs need no default-token permissions.
 permissions: {}
 
 jobs:
+  # Normalize `project-url` + `project-urls` into a JSON array of board URLs that
+  # the next job fans out over with a matrix.
+  setup:
+    name: Resolve board URLs
+    runs-on: ubuntu-latest
+    outputs:
+      urls: ${{ steps.norm.outputs.urls }}
+    steps:
+      - name: Normalize board URLs
+        id: norm
+        env:
+          PROJECT_URL: ${{ inputs.project-url }}
+          PROJECT_URLS: ${{ inputs.project-urls }}
+        run: |
+          set -euo pipefail
+
+          # Decide how to read `project-urls`: a JSON array (first non-space char
+          # is '[') or a plain newline/comma-separated list. Validate JSON up
+          # front so a malformed array gives a friendly error, not a jq trace.
+          mode=list
+          case "$(printf '%s' "$PROJECT_URLS" | tr -d '[:space:]')" in
+            '')    mode=empty ;;
+            '['*)  mode=json ;;
+          esac
+          if [ "$mode" = json ] && ! printf '%s' "$PROJECT_URLS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::error::projmagic: 'project-urls' starts with '[' but is not a valid JSON array of strings. Provide a JSON array or a newline/comma-separated list."
+            exit 1
+          fi
+
+          # Collect every candidate URL onto its own line: the single
+          # `project-url`, plus `project-urls` expanded from JSON or split on
+          # newlines/commas.
+          {
+            printf '%s\n' "$PROJECT_URL"
+            case "$mode" in
+              json) printf '%s' "$PROJECT_URLS" | jq -r '.[]' ;;
+              list) printf '%s' "$PROJECT_URLS" | tr ',' '\n' ;;
+              empty) : ;;
+            esac
+          } > candidates.txt
+
+          # Trim whitespace/CR, drop blanks, de-duplicate (order preserved).
+          urls="$(jq -R -s -c '
+            split("\n")
+            | map(gsub("\r"; "") | gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | reduce .[] as $u ([]; if any(.[]; . == $u) then . else . + [$u] end)
+          ' candidates.txt)"
+
+          count="$(printf '%s' "$urls" | jq 'length')"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::projmagic: no board URL provided. Set 'project-url' (a single URL) or 'project-urls' (a JSON array or newline/comma-separated list)."
+            exit 1
+          fi
+
+          echo "Resolved $count board(s): $urls"
+          echo "urls=$urls" >> "$GITHUB_OUTPUT"
+
   add-to-project:
     name: Add issue to project
+    needs: setup
     runs-on: ubuntu-latest
+    strategy:
+      # Don't let one bad board abort the others — every board is attempted and
+      # failures are reported per-board.
+      fail-fast: false
+      matrix:
+        url: ${{ fromJSON(needs.setup.outputs.urls) }}
     steps:
-      - name: Add issue to project board
+      - name: Add issue to ${{ matrix.url }}
         uses: actions/add-to-project@v2
         with:
-          project-url: ${{ inputs.project-url }}
+          project-url: ${{ matrix.url }}
           github-token: ${{ secrets.token }}
           labeled: ${{ inputs.labeled }}
           label-operator: ${{ inputs.label-operator }}
