@@ -1,0 +1,30 @@
+# Multi-board caller — add one issue to SEVERAL Projects v2 boards at once.
+# Copy this into YOUR repo at .github/workflows/add-to-project.yml and adjust
+# the board URLs.
+#
+# Prerequisite: a repo secret PROJMAGIC_TOKEN holding a classic PAT with the
+# `project` scope (+ `read:org` for org-owned boards). The repo GITHUB_TOKEN
+# does NOT work for Projects v2 — see the projmagic README.
+
+name: Add issues to my projects
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  add-to-project:
+    uses: jvrck/projmagic/.github/workflows/add-to-project.yml@v1
+    with:
+      # `project-urls` accepts a newline-separated list (shown here) OR a JSON
+      # array: ["https://github.com/users/you/projects/1", "https://.../2"].
+      # The issue is added to EVERY board listed.
+      project-urls: |
+        https://github.com/users/OWNER/projects/NUMBER
+        https://github.com/orgs/ORG/projects/NUMBER
+
+      # Optional label filter (delete if you want every issue added):
+      # labeled: bug, needs-triage
+      # label-operator: OR        # OR (any) | AND (all) | NOT (exclude)
+    secrets:
+      token: ${{ secrets.PROJMAGIC_TOKEN }}
