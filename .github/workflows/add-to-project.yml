@@ -72,7 +72,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       urls: ${{ steps.norm.outputs.urls }}
-      count: ${{ steps.norm.outputs.count }}
     steps:
       - name: Normalize board URLs
         id: norm
@@ -82,17 +81,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Collect every candidate URL onto its own line:
-          #  - the single `project-url`
-          #  - `project-urls`, expanded from a JSON array, or split on
-          #    newlines/commas when it is a plain list.
+          # Decide how to read `project-urls`: a JSON array (first non-space char
+          # is '[') or a plain newline/comma-separated list. Validate JSON up
+          # front so a malformed array gives a friendly error, not a jq trace.
+          mode=list
+          case "$(printf '%s' "$PROJECT_URLS" | tr -d '[:space:]')" in
+            '')    mode=empty ;;
+            '['*)  mode=json ;;
+          esac
+          if [ "$mode" = json ] && ! printf '%s' "$PROJECT_URLS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::error::projmagic: 'project-urls' starts with '[' but is not a valid JSON array of strings. Provide a JSON array or a newline/comma-separated list."
+            exit 1
+          fi
+
+          # Collect every candidate URL onto its own line: the single
+          # `project-url`, plus `project-urls` expanded from JSON or split on
+          # newlines/commas.
           {
             printf '%s\n' "$PROJECT_URL"
-            if printf '%s' "$PROJECT_URLS" | sed 's/^[[:space:]]*//' | head -c1 | grep -q '\['; then
-              printf '%s' "$PROJECT_URLS" | jq -r '.[]'
-            else
-              printf '%s' "$PROJECT_URLS" | tr ',' '\n'
-            fi
+            case "$mode" in
+              json) printf '%s' "$PROJECT_URLS" | jq -r '.[]' ;;
+              list) printf '%s' "$PROJECT_URLS" | tr ',' '\n' ;;
+              empty) : ;;
+            esac
           } > candidates.txt
 
           # Trim whitespace/CR, drop blanks, de-duplicate (order preserved).
@@ -110,10 +121,7 @@ jobs:
           fi
 
           echo "Resolved $count board(s): $urls"
-          {
-            echo "urls=$urls"
-            echo "count=$count"
-          } >> "$GITHUB_OUTPUT"
+          echo "urls=$urls" >> "$GITHUB_OUTPUT"
 
   add-to-project:
     name: Add issue to project
