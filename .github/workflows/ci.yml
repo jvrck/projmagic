@@ -25,3 +25,32 @@ jobs:
 
       - name: Run actionlint
         run: ./actionlint -color
+
+  # Regression guard for the inline board-URL normalize logic in
+  # add-to-project.yml (job `setup`, step `id: norm`). The test extracts that
+  # step's `run:` block with yq and execs the REAL shipped script — see
+  # tests/norm.bats. jq is preinstalled on ubuntu-latest; yq + bats are pinned.
+  test:
+    name: Test normalize logic
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yq (mikefarah, pinned)
+        run: |
+          curl -sSfL \
+            https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_amd64 \
+            -o "$RUNNER_TEMP/yq"
+          sudo install -m 0755 "$RUNNER_TEMP/yq" /usr/local/bin/yq
+          yq --version
+
+      - name: Install bats-core (pinned)
+        run: |
+          git clone --depth 1 --branch v1.13.0 \
+            https://github.com/bats-core/bats-core.git "$RUNNER_TEMP/bats-core"
+          sudo "$RUNNER_TEMP/bats-core/install.sh" /usr/local
+          bats --version
+
+      - name: Run normalize regression tests
+        run: bats --tap tests/
