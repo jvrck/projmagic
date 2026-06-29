@@ -55,11 +55,16 @@ setup_file() {
 # A valid iteration field "Sprint": active iterations S-cur (contains 2026-06-30)
 # and S-next; completed S-prev (latest completed) and S-old.
 setup() {
-  DEFAULT_CONFIG='{"fieldName":"Sprint","fieldFound":true,"isIterationField":true,"fieldId":"FIELD_SPRINT","iterations":[{"id":"it-cur","title":"S-cur","startDate":"2026-06-29","duration":14},{"id":"it-next","title":"S-next","startDate":"2026-07-13","duration":14}],"completedIterations":[{"id":"it-prev","title":"S-prev","startDate":"2026-06-15","duration":14},{"id":"it-old","title":"S-old","startDate":"2026-06-01","duration":14}],"boardIterationFields":["Sprint"]}'
+  # completedIterations is deliberately NOT sorted (S-old, the OLDER one, is
+  # element [0]) so the auto-source test discriminates max_by(.startDate) from a
+  # naive `.[0]`/first.
+  DEFAULT_CONFIG='{"fieldName":"Sprint","fieldFound":true,"isIterationField":true,"fieldId":"FIELD_SPRINT","iterations":[{"id":"it-cur","title":"S-cur","startDate":"2026-06-29","duration":14},{"id":"it-next","title":"S-next","startDate":"2026-07-13","duration":14}],"completedIterations":[{"id":"it-old","title":"S-old","startDate":"2026-06-01","duration":14},{"id":"it-prev","title":"S-prev","startDate":"2026-06-15","duration":14}],"boardIterationFields":["Sprint"]}'
 
   # In S-prev (it-prev): 2 open issues (#1,#2), 1 closed issue (#3), 1 open PR
-  # (#4). In S-cur (it-cur): 1 open issue (#5). No iteration: 1 open issue (#6).
-  DEFAULT_ITEMS='[{"type":"Issue","number":1,"state":"OPEN","url":"https://github.com/o/r/issues/1","itemId":"PVTI_1","iterationId":"it-prev"},{"type":"Issue","number":2,"state":"OPEN","url":"https://github.com/o/r/issues/2","itemId":"PVTI_2","iterationId":"it-prev"},{"type":"Issue","number":3,"state":"CLOSED","url":"https://github.com/o/r/issues/3","itemId":"PVTI_3","iterationId":"it-prev"},{"type":"PullRequest","number":4,"state":"OPEN","url":"https://github.com/o/r/pull/4","itemId":"PVTI_4","iterationId":"it-prev"},{"type":"Issue","number":5,"state":"OPEN","url":"https://github.com/o/r/issues/5","itemId":"PVTI_5","iterationId":"it-cur"},{"type":"Issue","number":6,"state":"OPEN","url":"https://github.com/o/r/issues/6","itemId":"PVTI_6","iterationId":null}]'
+  # (#4), 1 CLOSED PR (#7), 1 OPEN draft item (#8, type DraftIssue). In S-cur
+  # (it-cur): 1 open issue (#5). No iteration: 1 open issue (#6). #7 and #8 prove
+  # closed-PR and non-Issue/PR exclusion hold even with include-prs.
+  DEFAULT_ITEMS='[{"type":"Issue","number":1,"state":"OPEN","url":"https://github.com/o/r/issues/1","itemId":"PVTI_1","iterationId":"it-prev"},{"type":"Issue","number":2,"state":"OPEN","url":"https://github.com/o/r/issues/2","itemId":"PVTI_2","iterationId":"it-prev"},{"type":"Issue","number":3,"state":"CLOSED","url":"https://github.com/o/r/issues/3","itemId":"PVTI_3","iterationId":"it-prev"},{"type":"PullRequest","number":4,"state":"OPEN","url":"https://github.com/o/r/pull/4","itemId":"PVTI_4","iterationId":"it-prev"},{"type":"Issue","number":5,"state":"OPEN","url":"https://github.com/o/r/issues/5","itemId":"PVTI_5","iterationId":"it-cur"},{"type":"Issue","number":6,"state":"OPEN","url":"https://github.com/o/r/issues/6","itemId":"PVTI_6","iterationId":null},{"type":"PullRequest","number":7,"state":"CLOSED","url":"https://github.com/o/r/pull/7","itemId":"PVTI_7","iterationId":"it-prev"},{"type":"DraftIssue","number":8,"state":"OPEN","url":"https://github.com/o/r/issues/8","itemId":"PVTI_8","iterationId":"it-prev"}]'
 
   CONFIG_NO_COMPLETED='{"fieldName":"Sprint","fieldFound":true,"isIterationField":true,"fieldId":"FIELD_SPRINT","iterations":[{"id":"it-cur","title":"S-cur","startDate":"2026-06-29","duration":14}],"completedIterations":[],"boardIterationFields":["Sprint"]}'
 
@@ -137,6 +142,28 @@ assert_error_exit1() {
   [ "$(get_out target-id)" = "it-prev" ]
 }
 
+# Boundary cases pin the half-open window [startDate, startDate+duration). This
+# workflow is built to run ON the sprint-turnover day, so these are the most
+# operationally-likely dates — a '<'->'<=' or '>='->'>' off-by-one must fail here.
+@test "date window is START-INCLUSIVE: TODAY == S-cur startDate picks S-cur" {
+  SOURCE_ITERATION="S-prev" TODAY="2026-06-29" run_resolve
+  assert_ok
+  [ "$(get_out target-title)" = "S-cur" ]
+}
+
+@test "date window is END-EXCLUSIVE: TODAY == S-cur end == S-next start picks S-next" {
+  SOURCE_ITERATION="S-prev" TODAY="2026-07-13" run_resolve
+  assert_ok
+  [ "$(get_out target-title)" = "S-next" ]
+}
+
+@test "a day in the gap before any active sprint -> no-active-target error" {
+  # 2026-06-28 falls only inside the COMPLETED S-prev; auto-target searches active
+  # iterations only, so there is no active sprint -> fail loud.
+  SOURCE_ITERATION="S-prev" TODAY="2026-06-28" run_resolve
+  assert_error_exit1 "::error::projmagic: no active sprint contains today (2026-06-28)"
+}
+
 # --- source resolution ---------------------------------------------------------
 @test "auto source = the most-recently-completed iteration" {
   TODAY="2026-06-30" run_resolve
@@ -159,16 +186,19 @@ assert_error_exit1() {
 }
 
 # --- selection = in source AND open -------------------------------------------
-@test "selection = open issues in source (closed excluded, PR excluded, other-iteration excluded)" {
+# DEFAULT_ITEMS in it-prev: #1,#2 open issues; #3 closed issue; #4 open PR;
+# #7 closed PR; #8 open draft. #5 open issue is in it-cur; #6 has no iteration.
+@test "selection = open issues in source (closed/PR/draft/other-iteration all excluded)" {
   SOURCE_ITERATION="S-prev" TARGET_ITERATION="S-cur" run_resolve
   assert_ok
   [ "$(get_out match-count)" = "2" ]
   [ "$(printf '%s' "$(get_out plan)" | jq -c 'map(.number)')" = "[1,2]" ]
 }
 
-@test "include-prs = true also selects the open PR in source" {
+@test "include-prs=true adds the OPEN PR but still excludes the closed PR and the draft" {
   SOURCE_ITERATION="S-prev" TARGET_ITERATION="S-cur" INCLUDE_PRS="true" run_resolve
   assert_ok
+  # open issues #1,#2 + open PR #4; closed PR #7 (state) and draft #8 (type) excluded.
   [ "$(get_out match-count)" = "3" ]
   [ "$(printf '%s' "$(get_out plan)" | jq -c 'map(.number)')" = "[1,2,4]" ]
 }
@@ -224,4 +254,20 @@ assert_error_exit1() {
 @test "unknown explicit source-iteration title -> friendly ::error:: and exit 1" {
   SOURCE_ITERATION="Nope" TARGET_ITERATION="S-cur" run_resolve
   assert_error_exit1 "::error::projmagic: source-iteration 'Nope' not found"
+}
+
+# --- in-script defaults (run under set -u without the env injected) ------------
+@test "missing ITER_CONFIG/ITEMS exercise the in-script defaults and fail loud (no raw crash)" {
+  # Bypass run_resolve so ITER_CONFIG/ITEMS/SOURCE/TARGET/INCLUDE_PRS/DRY_RUN are
+  # genuinely UNSET: the script's `${VAR:-...}` defaults must hold under set -u,
+  # yielding ITER_CONFIG='{}' -> field-not-found friendly error (not a jq crash).
+  GH_OUT="$BATS_TEST_TMPDIR/github_output"
+  : > "$GH_OUT"
+  run env GITHUB_OUTPUT="$GH_OUT" TODAY="2026-06-30" bash "$BATS_FILE_TMPDIR/resolve.sh"
+  [ "$status" -eq 1 ]
+  case "$output" in
+    *"::error::projmagic: iteration field"*) : ;;
+    *) echo "expected friendly field-not-found error; got: $output"; return 1 ;;
+  esac
+  [ -z "$(grep '^source-id=' "$GH_OUT" || true)" ]
 }

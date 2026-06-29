@@ -117,13 +117,13 @@ jobs:
           FIELD: ${{ inputs.iteration-field }}
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2016  # $owner/$number are GraphQL variables, expanded by the API, not the shell
-          query='query($owner:String!,$number:Int!){
+          # shellcheck disable=SC2016  # $owner/$number/$cursor are GraphQL variables, expanded by the API, not the shell
+          query='query($owner:String!,$number:Int!,$cursor:String){
             OWNERROOT(login:$owner){
               projectV2(number:$number){
                 id
-                title
-                fields(first:50){
+                fields(first:100, after:$cursor){
+                  pageInfo { hasNextPage endCursor }
                   nodes{
                     __typename
                     ... on ProjectV2FieldCommon { id name }
@@ -142,26 +142,47 @@ jobs:
           }'
           query="${query/OWNERROOT/$ROOT}"
 
-          resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" 2>err.txt)" || true
-          combined="$(cat err.txt 2>/dev/null || true)"
-          proj=""
-          if [ -n "$resp" ]; then
-            combined="$combined $(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
-            proj="$(printf '%s' "$resp" | jq -c --arg r "$ROOT" '.data[$r].projectV2 // empty' 2>/dev/null || true)"
-          fi
-          if [ -z "$proj" ] || [ "$proj" = "null" ]; then
-            case "$combined" in
-              *[Ff]orbidden*|*"Resource not accessible"*|*[Ss]cope*|*INSUFFICIENT_SCOPES*|*401*|*403*)
-                echo "::error::projmagic: the Projects API rejected the token —${combined}. The 'token' secret must be a classic PAT with the 'project' scope (plus 'read:org' for org-owned boards). The repo GITHUB_TOKEN cannot access Projects v2." ;;
-              *)
-                echo "::error::projmagic: could not read project #$NUMBER for $ROOT '$OWNER' —${combined:- not found or not visible to the token}." ;;
-            esac
-            exit 1
-          fi
+          # Page ALL board fields (a board can have >100; the iteration field may
+          # sort beyond the first page) and accumulate the nodes.
+          project_id=""
+          nodes="[]"
+          cursor=""
+          while : ; do
+            resp=""; gh_rc=0
+            if [ -z "$cursor" ]; then
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" 2>err.txt)" || gh_rc=$?
+            else
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f cursor="$cursor" 2>err.txt)" || gh_rc=$?
+            fi
+            combined="$(cat err.txt 2>/dev/null || true)"
+            gql_errs=""; proj=""
+            if [ -n "$resp" ]; then
+              gql_errs="$(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
+              proj="$(printf '%s' "$resp" | jq -c --arg r "$ROOT" '.data[$r].projectV2 // empty' 2>/dev/null || true)"
+            fi
+            combined="$combined $gql_errs"
+            # Fail loud on ANY error signal — non-zero gh exit, a GraphQL .errors
+            # entry (even alongside partial data), or a missing project node.
+            if [ "$gh_rc" -ne 0 ] || [ -n "$gql_errs" ] || [ -z "$proj" ] || [ "$proj" = "null" ]; then
+              case "$combined" in
+                *[Ff]orbidden*|*"Resource not accessible"*|*[Ss]cope*|*INSUFFICIENT_SCOPES*|*401*|*403*)
+                  echo "::error::projmagic: the Projects API rejected the token —${combined}. The 'token' secret must be a classic PAT with the 'project' scope (plus 'read:org' for org-owned boards). The repo GITHUB_TOKEN cannot access Projects v2." ;;
+                *)
+                  echo "::error::projmagic: could not read project #$NUMBER for $ROOT '$OWNER' —${combined:- not found or not visible to the token}." ;;
+              esac
+              exit 1
+            fi
+            project_id="$(printf '%s' "$proj" | jq -r '.id')"
+            nodes="$(jq -c -n --argjson a "$nodes" --argjson b "$(printf '%s' "$proj" | jq -c '.fields.nodes')" '$a + $b')"
+            if [ "$(printf '%s' "$proj" | jq -r '.fields.pageInfo.hasNextPage')" = "true" ]; then
+              cursor="$(printf '%s' "$proj" | jq -r '.fields.pageInfo.endCursor')"
+            else
+              break
+            fi
+          done
 
-          project_id="$(printf '%s' "$proj" | jq -r '.id')"
-          iter_config="$(printf '%s' "$proj" | jq -c --arg name "$FIELD" '
-            .fields.nodes as $nodes
+          iter_config="$(printf '%s' "$nodes" | jq -c --arg name "$FIELD" '
+            . as $nodes
             | ($nodes | map(select(.__typename == "ProjectV2IterationField") | .name)) as $iterFields
             | ($nodes | map(select(.name == $name)) | first) as $f
             | {
@@ -179,7 +200,7 @@ jobs:
             echo "field-id=$field_id"
             echo "config=$iter_config"
           } >> "$GITHUB_OUTPUT"
-          echo "projmagic: read field config for '$FIELD' (board fields scanned)"
+          echo "projmagic: scanned $(printf '%s' "$nodes" | jq 'length') board field(s) for '$FIELD'"
 
       # 3. Page every item on the board and normalise to the items contract the
       #    `resolve` step selects over (type / number / state / url / item id /
@@ -220,18 +241,22 @@ jobs:
           all="[]"
           cursor=""
           while : ; do
+            resp=""; gh_rc=0
             if [ -z "$cursor" ]; then
-              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" 2>err.txt)" || true
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" 2>err.txt)" || gh_rc=$?
             else
-              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" -f cursor="$cursor" 2>err.txt)" || true
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" -f cursor="$cursor" 2>err.txt)" || gh_rc=$?
             fi
             combined="$(cat err.txt 2>/dev/null || true)"
-            items_node=""
+            gql_errs=""; items_node=""
             if [ -n "$resp" ]; then
-              combined="$combined $(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
+              gql_errs="$(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
               items_node="$(printf '%s' "$resp" | jq -c --arg r "$ROOT" '.data[$r].projectV2.items // empty' 2>/dev/null || true)"
             fi
-            if [ -z "$items_node" ] || [ "$items_node" = "null" ]; then
+            combined="$combined $gql_errs"
+            # Fail loud on ANY error signal — non-zero gh exit, a GraphQL .errors
+            # entry (even alongside partial data), or a missing items node.
+            if [ "$gh_rc" -ne 0 ] || [ -n "$gql_errs" ] || [ -z "$items_node" ] || [ "$items_node" = "null" ]; then
               case "$combined" in
                 *[Ff]orbidden*|*"Resource not accessible"*|*[Ss]cope*|*INSUFFICIENT_SCOPES*|*401*|*403*)
                   echo "::error::projmagic: the Projects API rejected the token —${combined}. The 'token' secret must be a classic PAT with the 'project' scope (plus 'read:org' for org-owned boards)." ;;
@@ -314,7 +339,8 @@ jobs:
             tgt="$(printf '%s' "$ITER_CONFIG" | jq -c --arg today "$TODAY" '
               def epoch($d): ($d + "T00:00:00Z" | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime);
               .iterations
-              | map(select((epoch($today)) >= epoch(.startDate)
+              | map(select(.startDate != null and .duration != null
+                           and (epoch($today)) >= epoch(.startDate)
                            and (epoch($today)) < (epoch(.startDate) + (.duration * 86400))))
               | (first // null)')"
             if [ "$tgt" = "null" ]; then
@@ -345,6 +371,11 @@ jobs:
           tgt_id="$(printf '%s' "$tgt" | jq -r '.id')"
           tgt_title="$(printf '%s' "$tgt" | jq -r '.title')"
 
+          # Iteration titles are board-controlled; strip any CR/LF so a title can
+          # never split or inject a GITHUB_OUTPUT line.
+          src_title="${src_title//[$'\r\n']/ }"
+          tgt_title="${tgt_title//[$'\r\n']/ }"
+
           if [ "$src_id" = "$tgt_id" ]; then
             echo "::error::projmagic: source and target iteration are the same ('${src_title}'); nothing to roll. Pass distinct source-iteration/target-iteration titles."
             exit 1
@@ -355,7 +386,8 @@ jobs:
           prs=false
           if [ "$INCLUDE_PRS" = "true" ]; then prs=true; fi
           plan="$(printf '%s' "$ITEMS" | jq -c --arg src "$src_id" --argjson prs "$prs" \
-            'map(select(.iterationId == $src and .state == "OPEN" and (.type == "Issue" or $prs)))')"
+            'map(select(.iterationId == $src and .state == "OPEN"
+                        and (.type == "Issue" or (.type == "PullRequest" and $prs))))')"
           count="$(printf '%s' "$plan" | jq 'length')"
 
           # dry-run gating: the move step consumes ONLY `moves`. In dry-run it is
@@ -393,8 +425,11 @@ jobs:
             echo "projmagic: no mutations to apply (dry-run, or 0 items to roll)."
             exit 0
           fi
-          # shellcheck disable=SC2016  # $project/$item/$field/$iter are GraphQL variables, expanded by the API, not the shell
-          mutation='mutation($project:ID!,$item:ID!,$field:ID!,$iter:ID!){
+          # NOTE: $iter is String! — value.iterationId is a String scalar in the
+          # Projects v2 schema, NOT an ID. Declaring it ID! makes GraphQL reject
+          # every call at validation time ("Type mismatch ... ID! / String").
+          # shellcheck disable=SC2016  # $project/$item/$field are GraphQL ID variables and $iter is a String, all expanded by the API, not the shell
+          mutation='mutation($project:ID!,$item:ID!,$field:ID!,$iter:String!){
             updateProjectV2ItemFieldValue(input:{
               projectId:$project, itemId:$item, fieldId:$field,
               value:{ iterationId:$iter }
@@ -404,7 +439,13 @@ jobs:
           while IFS= read -r item_id; do
             [ -n "$item_id" ] || continue
             if ! out="$(gh api graphql -f query="$mutation" -f project="$PROJECT_ID" -f item="$item_id" -f field="$FIELD_ID" -f iter="$TARGET_ID" 2>&1)"; then
-              echo "::error::projmagic: failed to move item $item_id —${out}. The 'token' secret must have the 'project' scope (plus 'read:org' for org boards)."
+              echo "moved=$moved" >> "$GITHUB_OUTPUT"
+              echo "::error::projmagic: failed to move item $item_id —${out}. Check the 'token' secret has the 'project' scope (plus 'read:org' for org boards) and that the target iteration still exists."
+              exit 1
+            fi
+            if [ -z "$(printf '%s' "$out" | jq -r '.data.updateProjectV2ItemFieldValue.projectV2Item.id // empty' 2>/dev/null || true)" ]; then
+              echo "moved=$moved" >> "$GITHUB_OUTPUT"
+              echo "::error::projmagic: move of item $item_id returned no confirmation —${out}."
               exit 1
             fi
             moved=$((moved + 1))
@@ -421,10 +462,22 @@ jobs:
           TARGET_TITLE: ${{ steps.resolve.outputs.target-title }}
           COUNT: ${{ steps.resolve.outputs.match-count }}
           DRY_RUN: ${{ inputs.dry-run }}
+          MOVE_OUTCOME: ${{ steps.move.outcome }}
+          MOVED: ${{ steps.move.outputs.moved }}
         run: |
           set -euo pipefail
-          verb="moved"
-          if [ "$DRY_RUN" = "true" ]; then verb="would move"; fi
+          # Report the truth, not the intent: only call items "moved" when the
+          # mutation step actually succeeded. On a failed/partial move the run is
+          # red and the summary must say so rather than claim the whole plan moved.
+          note=""
+          if [ "$DRY_RUN" = "true" ]; then
+            verb="would move"
+          elif [ "$MOVE_OUTCOME" = "success" ]; then
+            verb="moved"
+          else
+            verb="attempted to move"
+            note=" — run FAILED after moving ${MOVED:-0} of ${COUNT:-0}; see the errors above"
+          fi
           {
             echo "## projmagic — roll-sprint"
             echo ""
@@ -433,11 +486,11 @@ jobs:
             if [ "${COUNT:-0}" -eq 0 ]; then
               echo "0 open items in **${SOURCE_TITLE}** — nothing to roll."
             else
-              echo "${COUNT} open item(s) — ${verb} (dry-run: \`${DRY_RUN}\`):"
+              echo "${COUNT} open item(s) — ${verb} (dry-run: \`${DRY_RUN}\`)${note}:"
               echo ""
               echo "| item | url | action |"
               echo "| --- | --- | --- |"
               printf '%s' "$PLAN" | jq -r --arg verb "$verb" '.[] | "| #\(.number) | \(.url) | \($verb) |"'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "projmagic: ${COUNT:-0} item(s) ${verb} (dry-run=${DRY_RUN})."
+          echo "projmagic: ${COUNT:-0} item(s) ${verb} (dry-run=${DRY_RUN})${note}."
