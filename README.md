@@ -9,6 +9,10 @@ into a shareable reusable workflow. Add one small caller workflow to your reposi
 every new issue is added to your project board automatically — to a single board, or
 fanned out across several at once.
 
+projmagic also ships a second reusable workflow, **`roll-sprint.yml`**, that rolls every
+open issue from the previous sprint into the current one when a sprint turns over — see
+[Roll open issues into the current sprint](#roll-open-issues-into-the-current-sprint) below.
+
 ---
 
 ## ⚠️ Read this first — you need a `project`-scoped token
@@ -162,6 +166,72 @@ A green run isn't enough (see the failure symptom above). Confirm the item actua
 gh project item-list <number> --owner <owner> --format json \
   | jq '.items[] | {title: .content.title, url: .content.url}'
 ```
+
+## Roll open issues into the current sprint
+
+Sprint turnover strands unfinished work: when a sprint ends, its still-open issues sit in
+the old iteration until someone drags them onto the new sprint by hand. The
+**`roll-sprint.yml`** reusable workflow does it in one click — it moves every **open** issue
+still in the **previous** sprint of a Projects v2 board into the **current** sprint. Run it
+from the Actions tab when a sprint rolls over.
+
+Add a caller workflow to your repo, triggered by `workflow_dispatch`:
+
+`.github/workflows/roll-sprint.yml`:
+
+```yaml
+name: Roll open issues into the current sprint
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview only — list what would move, mutate nothing.
+        type: boolean
+        default: true
+
+jobs:
+  roll-sprint:
+    uses: jvrck/projmagic/.github/workflows/roll-sprint.yml@v1
+    with:
+      project-url: https://github.com/users/<you>/projects/<number>
+      dry-run: ${{ inputs.dry_run }}
+    secrets:
+      token: ${{ secrets.PROJMAGIC_TOKEN }}
+```
+
+By default it moves open issues from the **most-recently-completed** sprint into the
+**current** sprint (the iteration whose date range contains today). Override either end by
+iteration **title** with `source-iteration` / `target-iteration`. A ready-to-copy version
+lives in [`examples/roll-sprint.yml`](./examples/roll-sprint.yml).
+
+### ⚠️ Dry-run first, and it fails loud
+
+- **`dry-run: true` is the default.** The first run only **previews** the move plan (written
+  to the run summary) and mutates nothing. Re-run with `dry-run: false` to perform the moves.
+- **It never silently no-ops.** A malformed board URL, a missing / mis-named iteration field,
+  a field that isn't an iteration field, no active sprint today, no completed sprint to roll
+  from, `source == target`, or a token without the `project` scope each **fail the run** with
+  a friendly `::error::projmagic: …`. A green run means work happened — or an honest "0 open
+  items in `<sprint>`".
+- **Same token contract** as add-to-project: a classic PAT with the `project` scope (+
+  `read:org` for org boards) supplied as the `PROJMAGIC_TOKEN` secret. The repo `GITHUB_TOKEN`
+  cannot touch Projects v2 — see [the token section above](#️-read-this-first--you-need-a-project-scoped-token).
+
+### roll-sprint inputs
+
+| Input | Required | Default | Description |
+| --- | --- | --- | --- |
+| `project-url` | **yes** | — | The Projects v2 board URL. |
+| `iteration-field` | no | `Sprint` | Name of the board's iteration field (`Sprint`/`Iteration`/`Cycle`). |
+| `source-iteration` | no | `''` | Iteration **title** to move FROM; empty ⇒ the most-recently-completed sprint. |
+| `target-iteration` | no | `''` | Iteration **title** to move TO; empty ⇒ the current/active sprint. |
+| `include-prs` | no | `false` | Also move open PRs (default: issues only). |
+| `dry-run` | no | `true` | Preview only; set `false` to perform the moves. |
+
+| Secret | Required | Description |
+| --- | --- | --- |
+| `token` | **yes** | Classic PAT with the `project` scope (+ `read:org` for org boards). **Not** the repo `GITHUB_TOKEN`. |
 
 ## License
 
