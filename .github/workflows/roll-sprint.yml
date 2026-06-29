@@ -141,6 +141,8 @@ jobs:
             }
           }'
           query="${query/OWNERROOT/$ROOT}"
+          # Scratch file for gh stderr — kept out of the caller's workspace.
+          errf="$(mktemp)"
 
           # Page ALL board fields (a board can have >100; the iteration field may
           # sort beyond the first page) and accumulate the nodes.
@@ -150,11 +152,11 @@ jobs:
           while : ; do
             resp=""; gh_rc=0
             if [ -z "$cursor" ]; then
-              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" 2>err.txt)" || gh_rc=$?
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" 2>"$errf")" || gh_rc=$?
             else
-              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f cursor="$cursor" 2>err.txt)" || gh_rc=$?
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f cursor="$cursor" 2>"$errf")" || gh_rc=$?
             fi
-            combined="$(cat err.txt 2>/dev/null || true)"
+            combined="$(cat "$errf" 2>/dev/null || true)"
             gql_errs=""; proj=""
             if [ -n "$resp" ]; then
               gql_errs="$(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
@@ -237,17 +239,19 @@ jobs:
             }
           }'
           query="${query/OWNERROOT/$ROOT}"
+          # Scratch file for gh stderr — kept out of the caller's workspace.
+          errf="$(mktemp)"
 
           all="[]"
           cursor=""
           while : ; do
             resp=""; gh_rc=0
             if [ -z "$cursor" ]; then
-              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" 2>err.txt)" || gh_rc=$?
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" 2>"$errf")" || gh_rc=$?
             else
-              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" -f cursor="$cursor" 2>err.txt)" || gh_rc=$?
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" -f cursor="$cursor" 2>"$errf")" || gh_rc=$?
             fi
-            combined="$(cat err.txt 2>/dev/null || true)"
+            combined="$(cat "$errf" 2>/dev/null || true)"
             gql_errs=""; items_node=""
             if [ -n "$resp" ]; then
               gql_errs="$(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
