@@ -1,0 +1,44 @@
+# Roll-sprint caller — copy this into YOUR repo at
+#   .github/workflows/roll-sprint.yml
+# and adjust `project-url` (and the iteration-field name if it isn't `Sprint`).
+#
+# Run it by hand from the Actions tab when a sprint turns over: it moves every
+# OPEN issue still in the previous sprint into the current sprint.
+#
+# SAFE BY DEFAULT: the `dry_run` input below defaults to true, so the first run
+# only PREVIEWS what would move (see the run summary) and mutates nothing.
+# Re-run with dry_run unticked to actually move the items.
+#
+# Prerequisite: a repo secret PROJMAGIC_TOKEN holding a classic PAT with the
+# `project` scope (+ `read:org` for org-owned boards). The repo GITHUB_TOKEN
+# does NOT work for Projects v2 — see the projmagic README.
+
+name: Roll open issues into the current sprint
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview only — list what would move, mutate nothing.
+        type: boolean
+        default: true
+
+jobs:
+  roll-sprint:
+    uses: jvrck/projmagic/.github/workflows/roll-sprint.yml@v1
+    with:
+      # Your Projects v2 board URL:
+      #   user board: https://github.com/users/<you>/projects/<number>
+      #   org board:  https://github.com/orgs/<org>/projects/<number>
+      project-url: https://github.com/users/OWNER/projects/NUMBER
+
+      # Wire the dispatch input through to the reusable workflow's dry-run.
+      dry-run: ${{ inputs.dry_run }}
+
+      # Optional overrides (delete to use the safe auto-resolution):
+      # iteration-field: Sprint          # name of the board's iteration field
+      # source-iteration: ''             # title to move FROM (default: latest completed)
+      # target-iteration: ''             # title to move TO   (default: the active sprint)
+      # include-prs: false               # also move open PRs (default: issues only)
+    secrets:
+      token: ${{ secrets.PROJMAGIC_TOKEN }}

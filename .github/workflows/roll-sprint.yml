@@ -1,0 +1,500 @@
+name: Roll sprint
+
+# Reusable workflow — rolls every OPEN issue still sitting in the PREVIOUS
+# sprint (iteration) of a GitHub Projects v2 board into the CURRENT sprint.
+#
+# Call it from a caller workflow in YOUR repo that triggers on
+# `workflow_dispatch` (run it by hand from the Actions tab when a sprint turns
+# over). Reusable workflows run in the CALLER's event context, so the dispatch
+# trigger lives in the caller — this file declares none.
+#
+# Safe by default: `dry-run: true` lists what WOULD move and mutates nothing.
+# Set `dry-run: false` to actually move the items.
+#
+# IMPORTANT: Projects v2 boards are owned by a user or org, not by the repo, so
+# the repo-scoped GITHUB_TOKEN CANNOT read or move items on them (it 403s /
+# silently no-ops). You MUST pass a classic PAT with the `project` scope as the
+# `token` secret (add `read:org` for org-owned boards). See the README.
+
+on:
+  workflow_call:
+    inputs:
+      project-url:
+        description: >-
+          The Projects v2 board URL, e.g.
+          https://github.com/users/OWNER/projects/NUMBER or
+          https://github.com/orgs/ORG/projects/NUMBER.
+        type: string
+        required: true
+      iteration-field:
+        description: >-
+          Name of the board's iteration field. Boards commonly call it
+          `Sprint`, `Iteration`, or `Cycle`. Defaults to `Sprint`.
+        type: string
+        required: false
+        default: Sprint
+      source-iteration:
+        description: >-
+          Iteration TITLE to move FROM. Empty (the default) auto-resolves to the
+          most-recently-completed iteration.
+        type: string
+        required: false
+        default: ''
+      target-iteration:
+        description: >-
+          Iteration TITLE to move TO. Empty (the default) auto-resolves to the
+          current/active iteration (the one whose date range contains today).
+        type: string
+        required: false
+        default: ''
+      include-prs:
+        description: >-
+          Also move open pull requests, not just issues. Defaults to false
+          (issues only).
+        type: boolean
+        required: false
+        default: false
+      dry-run:
+        description: >-
+          List what WOULD move and mutate nothing. Defaults to true — the first
+          run is always a safe preview. Set to false to perform the moves.
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      token:
+        description: >-
+          A classic personal access token with the `project` scope (plus
+          `read:org` for org-owned boards). The repo GITHUB_TOKEN does NOT work
+          for Projects v2.
+        required: true
+
+# The workflow authenticates with the `token` secret above, not GITHUB_TOKEN,
+# so the job needs no default-token permissions.
+permissions: {}
+
+jobs:
+  roll:
+    name: Roll open issues into the current sprint
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Parse the board URL into owner type / login / project number. The
+      #    GraphQL root differs for user vs org boards (`user` / `organization`).
+      - name: Parse board URL
+        id: parse
+        env:
+          PROJECT_URL: ${{ inputs.project-url }}
+        run: |
+          set -euo pipefail
+          url="${PROJECT_URL%/}"
+          if [[ "$url" =~ ^https://github\.com/(users|orgs)/([^/]+)/projects/([0-9]+)$ ]]; then
+            kind="${BASH_REMATCH[1]}"
+            owner="${BASH_REMATCH[2]}"
+            number="${BASH_REMATCH[3]}"
+          else
+            echo "::error::projmagic: malformed project-url '${PROJECT_URL}'. Expected https://github.com/users/OWNER/projects/NUMBER or https://github.com/orgs/ORG/projects/NUMBER."
+            exit 1
+          fi
+          if [ "$kind" = "users" ]; then root="user"; else root="organization"; fi
+          {
+            echo "owner=$owner"
+            echo "number=$number"
+            echo "root=$root"
+          } >> "$GITHUB_OUTPUT"
+          echo "projmagic: board owner '$owner' ($root), project #$number"
+
+      # 2. Read the iteration-field configuration over GraphQL and normalise it
+      #    into the contract the pure `resolve` step consumes. Field validation
+      #    (found? iteration-typed?) is deferred to `resolve` so it is unit
+      #    tested; this step fails loud only on auth / project-not-found.
+      - name: Read iteration field config
+        id: config
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          OWNER: ${{ steps.parse.outputs.owner }}
+          NUMBER: ${{ steps.parse.outputs.number }}
+          ROOT: ${{ steps.parse.outputs.root }}
+          FIELD: ${{ inputs.iteration-field }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016  # $owner/$number/$cursor are GraphQL variables, expanded by the API, not the shell
+          query='query($owner:String!,$number:Int!,$cursor:String){
+            OWNERROOT(login:$owner){
+              projectV2(number:$number){
+                id
+                fields(first:100, after:$cursor){
+                  pageInfo { hasNextPage endCursor }
+                  nodes{
+                    __typename
+                    ... on ProjectV2FieldCommon { id name }
+                    ... on ProjectV2IterationField {
+                      id
+                      name
+                      configuration {
+                        iterations { id title startDate duration }
+                        completedIterations { id title startDate duration }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+          query="${query/OWNERROOT/$ROOT}"
+          # Scratch file for gh stderr — kept out of the caller's workspace.
+          errf="$(mktemp)"
+
+          # Page ALL board fields (a board can have >100; the iteration field may
+          # sort beyond the first page) and accumulate the nodes.
+          project_id=""
+          nodes="[]"
+          cursor=""
+          while : ; do
+            resp=""; gh_rc=0
+            if [ -z "$cursor" ]; then
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" 2>"$errf")" || gh_rc=$?
+            else
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f cursor="$cursor" 2>"$errf")" || gh_rc=$?
+            fi
+            combined="$(cat "$errf" 2>/dev/null || true)"
+            gql_errs=""; proj=""
+            if [ -n "$resp" ]; then
+              gql_errs="$(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
+              proj="$(printf '%s' "$resp" | jq -c --arg r "$ROOT" '.data[$r].projectV2 // empty' 2>/dev/null || true)"
+            fi
+            combined="$combined $gql_errs"
+            # Fail loud on ANY error signal — non-zero gh exit, a GraphQL .errors
+            # entry (even alongside partial data), or a missing project node.
+            if [ "$gh_rc" -ne 0 ] || [ -n "$gql_errs" ] || [ -z "$proj" ] || [ "$proj" = "null" ]; then
+              case "$combined" in
+                *[Ff]orbidden*|*"Resource not accessible"*|*[Ss]cope*|*INSUFFICIENT_SCOPES*|*401*|*403*)
+                  echo "::error::projmagic: the Projects API rejected the token —${combined}. The 'token' secret must be a classic PAT with the 'project' scope (plus 'read:org' for org-owned boards). The repo GITHUB_TOKEN cannot access Projects v2." ;;
+                *)
+                  echo "::error::projmagic: could not read project #$NUMBER for $ROOT '$OWNER' —${combined:- not found or not visible to the token}." ;;
+              esac
+              exit 1
+            fi
+            project_id="$(printf '%s' "$proj" | jq -r '.id')"
+            nodes="$(jq -c -n --argjson a "$nodes" --argjson b "$(printf '%s' "$proj" | jq -c '.fields.nodes')" '$a + $b')"
+            if [ "$(printf '%s' "$proj" | jq -r '.fields.pageInfo.hasNextPage')" = "true" ]; then
+              cursor="$(printf '%s' "$proj" | jq -r '.fields.pageInfo.endCursor')"
+            else
+              break
+            fi
+          done
+
+          iter_config="$(printf '%s' "$nodes" | jq -c --arg name "$FIELD" '
+            . as $nodes
+            | ($nodes | map(select(.__typename == "ProjectV2IterationField") | .name)) as $iterFields
+            | ($nodes | map(select(.name == $name)) | first) as $f
+            | {
+                fieldName: $name,
+                fieldFound: ($f != null),
+                isIterationField: ($f != null and $f.__typename == "ProjectV2IterationField"),
+                fieldId: ($f.id // null),
+                iterations: ($f.configuration.iterations // []),
+                completedIterations: ($f.configuration.completedIterations // []),
+                boardIterationFields: $iterFields
+              }')"
+          field_id="$(printf '%s' "$iter_config" | jq -r '.fieldId // ""')"
+          {
+            echo "project-id=$project_id"
+            echo "field-id=$field_id"
+            echo "config=$iter_config"
+          } >> "$GITHUB_OUTPUT"
+          echo "projmagic: scanned $(printf '%s' "$nodes" | jq 'length') board field(s) for '$FIELD'"
+
+      # 3. Page every item on the board and normalise to the items contract the
+      #    `resolve` step selects over (type / number / state / url / item id /
+      #    current iteration id).
+      - name: Read board items
+        id: items
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          OWNER: ${{ steps.parse.outputs.owner }}
+          NUMBER: ${{ steps.parse.outputs.number }}
+          ROOT: ${{ steps.parse.outputs.root }}
+          FIELD: ${{ inputs.iteration-field }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016  # $owner/$number/$field/$cursor are GraphQL variables, expanded by the API, not the shell
+          query='query($owner:String!,$number:Int!,$field:String!,$cursor:String){
+            OWNERROOT(login:$owner){
+              projectV2(number:$number){
+                items(first:100, after:$cursor){
+                  pageInfo { hasNextPage endCursor }
+                  nodes{
+                    id
+                    fieldValueByName(name:$field){
+                      ... on ProjectV2ItemFieldIterationValue { iterationId }
+                    }
+                    content{
+                      __typename
+                      ... on Issue { number state url }
+                      ... on PullRequest { number state url }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+          query="${query/OWNERROOT/$ROOT}"
+          # Scratch file for gh stderr — kept out of the caller's workspace.
+          errf="$(mktemp)"
+
+          all="[]"
+          cursor=""
+          while : ; do
+            resp=""; gh_rc=0
+            if [ -z "$cursor" ]; then
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" 2>"$errf")" || gh_rc=$?
+            else
+              resp="$(gh api graphql -f query="$query" -f owner="$OWNER" -F number="$NUMBER" -f field="$FIELD" -f cursor="$cursor" 2>"$errf")" || gh_rc=$?
+            fi
+            combined="$(cat "$errf" 2>/dev/null || true)"
+            gql_errs=""; items_node=""
+            if [ -n "$resp" ]; then
+              gql_errs="$(printf '%s' "$resp" | jq -r '(.errors // []) | map(.message) | join("; ")' 2>/dev/null || true)"
+              items_node="$(printf '%s' "$resp" | jq -c --arg r "$ROOT" '.data[$r].projectV2.items // empty' 2>/dev/null || true)"
+            fi
+            combined="$combined $gql_errs"
+            # Fail loud on ANY error signal — non-zero gh exit, a GraphQL .errors
+            # entry (even alongside partial data), or a missing items node.
+            if [ "$gh_rc" -ne 0 ] || [ -n "$gql_errs" ] || [ -z "$items_node" ] || [ "$items_node" = "null" ]; then
+              case "$combined" in
+                *[Ff]orbidden*|*"Resource not accessible"*|*[Ss]cope*|*INSUFFICIENT_SCOPES*|*401*|*403*)
+                  echo "::error::projmagic: the Projects API rejected the token —${combined}. The 'token' secret must be a classic PAT with the 'project' scope (plus 'read:org' for org-owned boards)." ;;
+                *)
+                  echo "::error::projmagic: could not read board items —${combined:- empty response}." ;;
+              esac
+              exit 1
+            fi
+            page="$(printf '%s' "$items_node" | jq -c '
+              [ .nodes[]
+                | select(.content.__typename == "Issue" or .content.__typename == "PullRequest")
+                | { type: .content.__typename,
+                    number: .content.number,
+                    state: .content.state,
+                    url: .content.url,
+                    itemId: .id,
+                    iterationId: (.fieldValueByName.iterationId // null) } ]')"
+            all="$(jq -c -n --argjson a "$all" --argjson b "$page" '$a + $b')"
+            if [ "$(printf '%s' "$items_node" | jq -r '.pageInfo.hasNextPage')" = "true" ]; then
+              cursor="$(printf '%s' "$items_node" | jq -r '.pageInfo.endCursor')"
+            else
+              break
+            fi
+          done
+          echo "items=$all" >> "$GITHUB_OUTPUT"
+          echo "projmagic: read $(printf '%s' "$all" | jq 'length') item(s) from the board"
+
+      # 4. PURE transform (NO network) — given the iteration-field config and the
+      #    items as JSON, compute the source iteration, the target iteration and
+      #    the move-list. This is the unit under test: tests/roll-sprint.bats
+      #    extracts THIS step's `run:` block with yq and execs it against fixture
+      #    JSON (mirrors how tests/norm.bats tests the add-to-project normalize
+      #    step). Keep it self-contained: env in, GITHUB_OUTPUT + ::error:: out.
+      - name: Resolve source/target iterations and select items
+        id: resolve
+        env:
+          ITER_CONFIG: ${{ steps.config.outputs.config }}
+          ITEMS: ${{ steps.items.outputs.items }}
+          SOURCE_ITERATION: ${{ inputs.source-iteration }}
+          TARGET_ITERATION: ${{ inputs.target-iteration }}
+          INCLUDE_PRS: ${{ inputs.include-prs }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          # Defaults keep the extracted script robust under `set -u` and let the
+          # tests inject only the inputs they exercise. TODAY is env-injectable
+          # so date-based resolution is deterministic in tests.
+          if [ -z "${ITER_CONFIG:-}" ]; then ITER_CONFIG='{}'; fi
+          if [ -z "${ITEMS:-}" ]; then ITEMS='[]'; fi
+          SOURCE_ITERATION="${SOURCE_ITERATION:-}"
+          TARGET_ITERATION="${TARGET_ITERATION:-}"
+          INCLUDE_PRS="${INCLUDE_PRS:-false}"
+          DRY_RUN="${DRY_RUN:-true}"
+          TODAY="${TODAY:-$(date -u +%F)}"
+
+          field_name="$(printf '%s' "$ITER_CONFIG" | jq -r '.fieldName // ""')"
+          iter_fields="$(printf '%s' "$ITER_CONFIG" | jq -r '(.boardIterationFields // []) | if length > 0 then join(", ") else "(none)" end')"
+
+          # The named field must exist AND be an iteration field, else fail loud.
+          if [ "$(printf '%s' "$ITER_CONFIG" | jq -r '.fieldFound // false')" != "true" ]; then
+            echo "::error::projmagic: iteration field '${field_name}' not found on the board. Iteration fields available: ${iter_fields}. Set 'iteration-field' to one of these."
+            exit 1
+          fi
+          if [ "$(printf '%s' "$ITER_CONFIG" | jq -r '.isIterationField // false')" != "true" ]; then
+            echo "::error::projmagic: field '${field_name}' is not an iteration field. Iteration fields available: ${iter_fields}. Set 'iteration-field' to an iteration field."
+            exit 1
+          fi
+
+          # Resolve TARGET: explicit title (across all iterations) else the
+          # active sprint whose [startDate, startDate+duration) contains TODAY.
+          if [ -n "$TARGET_ITERATION" ]; then
+            tgt="$(printf '%s' "$ITER_CONFIG" | jq -c --arg t "$TARGET_ITERATION" \
+              '(.iterations + .completedIterations) | map(select(.title == $t)) | (first // null)')"
+            if [ "$tgt" = "null" ]; then
+              echo "::error::projmagic: target-iteration '${TARGET_ITERATION}' not found in field '${field_name}'."
+              exit 1
+            fi
+          else
+            tgt="$(printf '%s' "$ITER_CONFIG" | jq -c --arg today "$TODAY" '
+              def epoch($d): ($d + "T00:00:00Z" | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime);
+              .iterations
+              | map(select(.startDate != null and .duration != null
+                           and (epoch($today)) >= epoch(.startDate)
+                           and (epoch($today)) < (epoch(.startDate) + (.duration * 86400))))
+              | (first // null)')"
+            if [ "$tgt" = "null" ]; then
+              echo "::error::projmagic: no active sprint contains today (${TODAY}) in field '${field_name}'. Pass target-iteration explicitly."
+              exit 1
+            fi
+          fi
+
+          # Resolve SOURCE: explicit title else the most-recently-completed sprint.
+          if [ -n "$SOURCE_ITERATION" ]; then
+            src="$(printf '%s' "$ITER_CONFIG" | jq -c --arg t "$SOURCE_ITERATION" \
+              '(.iterations + .completedIterations) | map(select(.title == $t)) | (first // null)')"
+            if [ "$src" = "null" ]; then
+              echo "::error::projmagic: source-iteration '${SOURCE_ITERATION}' not found in field '${field_name}'."
+              exit 1
+            fi
+          else
+            src="$(printf '%s' "$ITER_CONFIG" | jq -c \
+              '.completedIterations | if length == 0 then null else max_by(.startDate) end')"
+            if [ "$src" = "null" ]; then
+              echo "::error::projmagic: no completed sprint to roll from in field '${field_name}'. Pass source-iteration explicitly."
+              exit 1
+            fi
+          fi
+
+          src_id="$(printf '%s' "$src" | jq -r '.id')"
+          src_title="$(printf '%s' "$src" | jq -r '.title')"
+          tgt_id="$(printf '%s' "$tgt" | jq -r '.id')"
+          tgt_title="$(printf '%s' "$tgt" | jq -r '.title')"
+
+          # Iteration titles are board-controlled; strip any CR/LF so a title can
+          # never split or inject a GITHUB_OUTPUT line.
+          src_title="${src_title//[$'\r\n']/ }"
+          tgt_title="${tgt_title//[$'\r\n']/ }"
+
+          if [ "$src_id" = "$tgt_id" ]; then
+            echo "::error::projmagic: source and target iteration are the same ('${src_title}'); nothing to roll. Pass distinct source-iteration/target-iteration titles."
+            exit 1
+          fi
+
+          # Select: items in the source iteration that are OPEN. PRs are excluded
+          # unless include-prs; closed items are always excluded.
+          prs=false
+          if [ "$INCLUDE_PRS" = "true" ]; then prs=true; fi
+          plan="$(printf '%s' "$ITEMS" | jq -c --arg src "$src_id" --argjson prs "$prs" \
+            'map(select(.iterationId == $src and .state == "OPEN"
+                        and (.type == "Issue" or (.type == "PullRequest" and $prs))))')"
+          count="$(printf '%s' "$plan" | jq 'length')"
+
+          # dry-run gating: the move step consumes ONLY `moves`. In dry-run it is
+          # empty, so a dry-run can never carry a mutation payload downstream.
+          if [ "$DRY_RUN" = "false" ]; then moves="$plan"; else moves="[]"; fi
+
+          {
+            echo "source-id=$src_id"
+            echo "source-title=$src_title"
+            echo "target-id=$tgt_id"
+            echo "target-title=$tgt_title"
+            echo "match-count=$count"
+            echo "plan=$plan"
+            echo "moves=$moves"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "projmagic: source '${src_title}' (${src_id}) -> target '${tgt_title}' (${tgt_id})"
+          echo "projmagic: ${count} open item(s) selected to roll (dry-run=${DRY_RUN})"
+
+      # 5. Apply the moves. `moves` is empty under dry-run, so this step is a
+      #    no-op preview then. Each move is a single updateProjectV2ItemFieldValue
+      #    mutation setting the item's iteration to the target.
+      - name: Apply moves
+        id: move
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          PROJECT_ID: ${{ steps.config.outputs.project-id }}
+          FIELD_ID: ${{ steps.config.outputs.field-id }}
+          TARGET_ID: ${{ steps.resolve.outputs.target-id }}
+          MOVES: ${{ steps.resolve.outputs.moves }}
+        run: |
+          set -euo pipefail
+          n="$(printf '%s' "$MOVES" | jq 'length')"
+          if [ "$n" -eq 0 ]; then
+            echo "projmagic: no mutations to apply (dry-run, or 0 items to roll)."
+            exit 0
+          fi
+          # NOTE: $iter is String! — value.iterationId is a String scalar in the
+          # Projects v2 schema, NOT an ID. Declaring it ID! makes GraphQL reject
+          # every call at validation time ("Type mismatch ... ID! / String").
+          # shellcheck disable=SC2016  # $project/$item/$field are GraphQL ID variables and $iter is a String, all expanded by the API, not the shell
+          mutation='mutation($project:ID!,$item:ID!,$field:ID!,$iter:String!){
+            updateProjectV2ItemFieldValue(input:{
+              projectId:$project, itemId:$item, fieldId:$field,
+              value:{ iterationId:$iter }
+            }){ projectV2Item { id } }
+          }'
+          moved=0
+          while IFS= read -r item_id; do
+            [ -n "$item_id" ] || continue
+            if ! out="$(gh api graphql -f query="$mutation" -f project="$PROJECT_ID" -f item="$item_id" -f field="$FIELD_ID" -f iter="$TARGET_ID" 2>&1)"; then
+              echo "moved=$moved" >> "$GITHUB_OUTPUT"
+              echo "::error::projmagic: failed to move item $item_id —${out}. Check the 'token' secret has the 'project' scope (plus 'read:org' for org boards) and that the target iteration still exists."
+              exit 1
+            fi
+            if [ -z "$(printf '%s' "$out" | jq -r '.data.updateProjectV2ItemFieldValue.projectV2Item.id // empty' 2>/dev/null || true)" ]; then
+              echo "moved=$moved" >> "$GITHUB_OUTPUT"
+              echo "::error::projmagic: move of item $item_id returned no confirmation —${out}."
+              exit 1
+            fi
+            moved=$((moved + 1))
+          done < <(printf '%s' "$MOVES" | jq -r '.[].itemId')
+          echo "moved=$moved" >> "$GITHUB_OUTPUT"
+          echo "projmagic: moved $moved item(s) into the target sprint."
+
+      # 6. Write the human-readable plan/result to the run summary.
+      - name: Report
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        env:
+          PLAN: ${{ steps.resolve.outputs.plan }}
+          SOURCE_TITLE: ${{ steps.resolve.outputs.source-title }}
+          TARGET_TITLE: ${{ steps.resolve.outputs.target-title }}
+          COUNT: ${{ steps.resolve.outputs.match-count }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          MOVE_OUTCOME: ${{ steps.move.outcome }}
+          MOVED: ${{ steps.move.outputs.moved }}
+        run: |
+          set -euo pipefail
+          # Report the truth, not the intent: only call items "moved" when the
+          # mutation step actually succeeded. On a failed/partial move the run is
+          # red and the summary must say so rather than claim the whole plan moved.
+          note=""
+          if [ "$DRY_RUN" = "true" ]; then
+            verb="would move"
+          elif [ "$MOVE_OUTCOME" = "success" ]; then
+            verb="moved"
+          else
+            verb="attempted to move"
+            note=" — run FAILED after moving ${MOVED:-0} of ${COUNT:-0}; see the errors above"
+          fi
+          {
+            echo "## projmagic — roll-sprint"
+            echo ""
+            echo "Source iteration: **${SOURCE_TITLE}** &rarr; Target iteration: **${TARGET_TITLE}**"
+            echo ""
+            if [ "${COUNT:-0}" -eq 0 ]; then
+              echo "0 open items in **${SOURCE_TITLE}** — nothing to roll."
+            else
+              echo "${COUNT} open item(s) — ${verb} (dry-run: \`${DRY_RUN}\`)${note}:"
+              echo ""
+              echo "| item | url | action |"
+              echo "| --- | --- | --- |"
+              printf '%s' "$PLAN" | jq -r --arg verb "$verb" '.[] | "| #\(.number) | \(.url) | \($verb) |"'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "projmagic: ${COUNT:-0} item(s) ${verb} (dry-run=${DRY_RUN})${note}."
