@@ -10,6 +10,11 @@ Regression guards for the real inline logic in projmagic's reusable workflows:
   `.github/workflows/roll-sprint.yml` (job `roll`, step `id: resolve`): the pure
   transform that, given the iteration-field config + the board's items as JSON,
   computes the source iteration, the target iteration, and the move-list.
+- **`runs-on.bats`** — the **`runs-on` input** on both reusable workflows. Not an
+  inline script but workflow *structure*, so it asserts against the YAML rather
+  than exec'ing anything: the input is declared, optional, documented, defaults
+  to `["ubuntu-latest"]`, and is threaded to **every** job with no hardcoded
+  runner left behind.
 
 ## Why they're shaped this way
 
@@ -52,3 +57,10 @@ PR · **dry-run collects the move-list but emits no mutation payload** ·
 · no active sprint today → `::error::` + exit 1 · no completed sprint to roll from
 → `::error::` + exit 1 · unknown / non-iteration field → `::error::` + exit 1 ·
 unknown explicit source/target title → `::error::` + exit 1.
+
+**runs-on** — input declared on both workflows · optional `string` · non-empty
+description · **default is `["ubuntu-latest"]`** (the load-bearing one: projmagic
+is public, and a non-hosted default would break every consumer that doesn't set
+the input) · the default is valid JSON and survives `fromJSON` · every job —
+enumerated by name, so a newly added job can't quietly miss it — uses
+`${{ fromJSON(inputs.runs-on) }}` · no hardcoded runner label survives.
