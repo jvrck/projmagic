@@ -52,6 +52,17 @@ on:
         type: string
         required: false
         default: OR
+      runs-on:
+        description: >-
+          Runner labels for this workflow's jobs, as a JSON array of label
+          strings — e.g. '["ubuntu-latest"]' (the default) or
+          '["self-hosted","linux"]'. A reusable workflow's `runs-on` cannot
+          otherwise be overridden by its caller, so this is the only way to run
+          projmagic on your own runners. It is a JSON array rather than a bare
+          label because `runs-on` takes a label SET; see the README.
+        type: string
+        required: false
+        default: '["ubuntu-latest"]'
     secrets:
       token:
         description: >-
@@ -69,7 +80,7 @@ jobs:
   # the next job fans out over with a matrix.
   setup:
     name: Resolve board URLs
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     outputs:
       urls: ${{ steps.norm.outputs.urls }}
     steps:
@@ -126,7 +137,7 @@ jobs:
   add-to-project:
     name: Add issue to project
     needs: setup
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     strategy:
       # Don't let one bad board abort the others — every board is attempted and
       # failures are reported per-board.

@@ -140,6 +140,7 @@ A ready-to-copy version lives in [`examples/multi-board.yml`](./examples/multi-b
 | `project-urls` | yes\* | `''` | Multiple board URLs — a JSON array or a newline/comma-separated list. Combined with `project-url`; duplicates removed. |
 | `labeled` | no | `''` | Comma-separated label filter; empty means add every issue. |
 | `label-operator` | no | `OR` | How `labeled` matches: `OR` (any), `AND` (all), `NOT` (exclude). |
+| `runs-on` | no | `["ubuntu-latest"]` | Runner labels for the workflow's jobs, as a **JSON array** string. See [Choosing a runner](#choosing-a-runner). |
 
 \* Provide **`project-url`** (single board) **or** **`project-urls`** (one or more). At least one URL must resolve, or the run fails fast with a clear error.
 
@@ -152,6 +153,28 @@ A ready-to-copy version lives in [`examples/multi-board.yml`](./examples/multi-b
 The caller's trigger controls this. `actions/add-to-project` (which projmagic wraps)
 supports issue events `opened`, `reopened`, `transferred`, and `labeled`. Most repos use
 `opened` (plus `labeled` if filtering by label).
+
+## Choosing a runner
+
+Both reusable workflows run on **`ubuntu-latest`** by default — you can ignore this
+section entirely. If you need them on your own runners (a self-hosted fleet, or a
+GitHub-hosted minutes allowance that has run out), pass `runs-on`:
+
+```yaml
+    with:
+      project-url: https://github.com/users/<you>/projects/<number>
+      runs-on: '["self-hosted", "linux"]'
+```
+
+A caller **cannot** override a reusable workflow's `runs-on` directly — that is why this
+input exists.
+
+**Why a JSON array and not a bare label.** `runs-on` takes a label *set*, not a single
+label: a self-hosted target is normally written `[self-hosted, my-label]`. A bare string
+would be read as one label named literally `[self-hosted, my-label]`, matching no runner
+and leaving the job **queued forever** instead of failing. So the input is a JSON array
+string, which the workflow feeds through `fromJSON`. A single label is just a one-element
+array: `'["ubuntu-latest"]'`.
 
 ## Pinning
 
@@ -228,6 +251,7 @@ lives in [`examples/roll-sprint.yml`](./examples/roll-sprint.yml).
 | `target-iteration` | no | `''` | Iteration **title** to move TO; empty ⇒ the current/active sprint. |
 | `include-prs` | no | `false` | Also move open PRs (default: issues only). |
 | `dry-run` | no | `true` | Preview only; set `false` to perform the moves. |
+| `runs-on` | no | `["ubuntu-latest"]` | Runner labels for the workflow's job, as a **JSON array** string. See [Choosing a runner](#choosing-a-runner). |
 
 | Secret | Required | Description |
 | --- | --- | --- |

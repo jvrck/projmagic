@@ -61,6 +61,17 @@ on:
         type: boolean
         required: false
         default: true
+      runs-on:
+        description: >-
+          Runner labels for this workflow's job, as a JSON array of label
+          strings — e.g. '["ubuntu-latest"]' (the default) or
+          '["self-hosted","linux"]'. A reusable workflow's `runs-on` cannot
+          otherwise be overridden by its caller, so this is the only way to run
+          projmagic on your own runners. It is a JSON array rather than a bare
+          label because `runs-on` takes a label SET; see the README.
+        type: string
+        required: false
+        default: '["ubuntu-latest"]'
     secrets:
       token:
         description: >-
@@ -76,7 +87,7 @@ permissions: {}
 jobs:
   roll:
     name: Roll open issues into the current sprint
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     steps:
       # 1. Parse the board URL into owner type / login / project number. The
       #    GraphQL root differs for user vs org boards (`user` / `organization`).
